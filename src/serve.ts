@@ -161,25 +161,48 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
         });
         logger.info('Content fetched successfully');
 
-        // If there's an error but we still have some content, return it with a note
-        if (result.error && result.markdown) {
-            return {
-                content: [
-                    {
-                        type: 'text',
-                        text: `${result.markdown}\n\n---\n*Note: ${result.error}*`,
-                    },
-                ],
-            };
-        }
-
         // If there's an error and no content, throw it
         if (result.error && !result.markdown) {
             throw new Error(result.error);
         }
 
+        // Build final markdown (append error note if partial content)
+        const markdown: string = result.error && result.markdown
+            ? `${result.markdown}\n\n---\n*Note: ${result.error}*`
+            : result.markdown;
+
+        // If content exceeds inline threshold, spool to a tmp file to avoid
+        // flooding the agent's context window. The agent can read the file
+        // using the Read tool.
+        const INLINE_CHAR_LIMIT = 16000; // ~4 000 tokens
+        if (markdown.length > INLINE_CHAR_LIMIT) {
+            if (!fsPromises) {
+                fsPromises = await import('fs/promises');
+            }
+            if (!pathModule) {
+                pathModule = await import('path');
+            }
+            const { createHash } = await import('crypto');
+            const urlHash = createHash('sha256').update(args.url).digest('hex').slice(0, 8);
+            const tmpFile = pathModule.join('/tmp', `read-website-${urlHash}.md`);
+            await fsPromises.writeFile(tmpFile, markdown, 'utf8');
+            const approxTokens = Math.round(markdown.length / 4).toLocaleString();
+            logger.info(`Content large (~${approxTokens} tokens), spooled to ${tmpFile}`);
+            return {
+                content: [{
+                    type: 'text',
+                    text: [
+                        `Content is large (~${approxTokens} tokens, ${markdown.length.toLocaleString()} chars) — saved to avoid context overflow.`,
+                        `File: ${tmpFile}`,
+                        ``,
+                        `Read it with the Read tool:  Read("${tmpFile}")`,
+                    ].join('\n'),
+                }],
+            };
+        }
+
         return {
-            content: [{ type: 'text', text: result.markdown }],
+            content: [{ type: 'text', text: markdown }],
         };
     } catch (error: any) {
         logger.error('Error fetching content:', error.message);
